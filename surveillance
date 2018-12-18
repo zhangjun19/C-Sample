@@ -1,0 +1,80 @@
+Sub UpdateHist()
+Dim controlSht As Worksheet
+Set controlSht = ThisWorkbook.Sheets("Control")
+If Range("PassWord").Value = "" Then
+    Range("PassWord").Value = InputBox("Please input your password to database for user name " + Range("UserName").Value)
+End If
+Dim connHandler As String: connHandler = Application.Run("aig.MI.OracleConnection", "UpdateHist", Range("UserName").Value, Range("PassWord").Value, "IDWDEV.aig.com", True)
+Dim DP As String
+DP = Range("DataPeriod").Value
+Dim sql As String
+sql = "insert into prismods.lp_hist_vector@IDWDEV (select * from (with pool_type as (select distinct pool_id as pool_id, case when substr(name, -1)='@' then 'ALT A' when substr(name, -1)='*' then 'BC' else 'MBS' end as datatype from prism.lp_pool_summary@IDWPRD where latest_record_indicator = 'Y' and lpmperiod = '"
+sql = sql & DP
+sql = sql & "' ), loan_list as (select distinct loan.loan_id, pool_type.datatype from (prism.lp_pool_summary@IDWPRD pool join PRISM.LP_LOAN_MASTER@IDWPRD loan on pool.latest_record_indicator = 'Y' and loan.latest_record_indicator = 'Y' and pool.pool_id = loan.pool_id ) join pool_type on pool.pool_id = pool_type.pool_id),"
+sql = sql & "pre_list as (select pre.lpmperiod, pre.loan_id, pre.inv_bal, pre.mba_stat, pre.ots_stat from prism.lp_loan_cq_hist@IDWPRD pre join loan_list on pre.lpmperiod + 1 ='"
+sql = sql & DP
+sql = sql & "' and pre.loan_id=loan_list.loan_id and pre.inv_bal>99.99 and pre.mba_stat != '0' and pre.latest_record_indicator='Y'),"
+sql = sql & "cur_list as (select cur.lpmperiod, cur.loan_id, pool.deal_name, pool.name pool_name, loan_list.datatype, cur.sch_princ, cur.inv_bal, cur.mba_stat, cur.ots_stat, cur.loss_amt from (prism.lp_loan_cq_hist@IDWPRD cur join loan_list on cur.lpmperiod ='"
+sql = sql & DP
+sql = sql & "' and cur.loan_id=loan_list.loan_id and cur.latest_record_indicator = 'Y' ) join prism.lp_pool_summary@IDWPRD pool on cur.pool_id = pool.pool_id and cur.lpmperiod = pool.lpmperiod and pool.latest_record_indicator='Y'  and pool.curr_loans > 0 ),"
+sql = sql & "loan_performance as ( select cur_list.lpmperiod, cur_list.datatype, cur_list.deal_name, cur_list.pool_name, pre_list.inv_bal as pre_inv_bal, cur_list.sch_princ as sch_princ, cur_list.inv_bal as cur_inv_bal,"
+sql = sql & "case when cur_list.datatype in ('MBS', 'ALT A') and cur_list.mba_stat='0' then pre_list.inv_bal when cur_list.datatype='BC' and cur_list.ots_stat='0' then pre_list.inv_bal else 0 end as payoff_bal, "
+sql = sql & "case when cur_list.datatype in ('MBS', 'ALT A') and cur_list.mba_stat='0' and (pre_list.mba_stat in ('C', '3', '6') or (pre_list.mba_stat in ('9','F') and cur_list.loss_amt<100)) then pre_list.inv_bal when cur_list.datatype='BC' and cur_list.ots_stat='0' and (pre_list.ots_stat in ('C', '3', '6') or (pre_list.ots_stat in ('9','F') and cur_list.loss_amt<100) ) then pre_list.inv_bal else 0 end as prepay_bal,"
+sql = sql & "case when cur_list.datatype in ('MBS', 'ALT A') and cur_list.mba_stat in ('6', '9', 'F', 'R') then cur_list.inv_bal when cur_list.datatype='BC' and cur_list.ots_stat in ('6', '9', 'F', 'R') then cur_list.inv_bal else 0 end as delinq_60p_bal,"
+sql = sql & "case when cur_list.datatype in ('MBS', 'ALT A') and cur_list.mba_stat = '0' and cur_list.loss_amt>0 then pre_list.inv_bal when cur_list.datatype='BC' and cur_list.ots_stat = '0' and cur_list.loss_amt>0 then pre_list.inv_bal else 0 end as payoff_loss_bal,"
+sql = sql & "case when cur_list.datatype in ('MBS', 'ALT A') and cur_list.mba_stat = '0' and cur_list.loss_amt>0 then cur_list.loss_amt when cur_list.datatype='BC' and cur_list.ots_stat = '0' and cur_list.loss_amt>0 then cur_list.loss_amt else 0 end as payoff_loss_amt "
+sql = sql & "from cur_list join pre_list on pre_list.loan_id = cur_list.loan_id and pre_list.lpmperiod +1 = cur_list.lpmperiod),"
+sql = sql & "pool_performance as ( select lpmperiod, datatype, deal_name, pool_name, sum(pre_inv_bal)-sum(sch_princ) as sch_bal, sum(payoff_bal) as payoff, sum(prepay_bal) as prepay, sum(cur_inv_bal) as inv_bal, sum(delinq_60p_bal) as delinq_bal, sum(payoff_loss_bal) as loss_bal, sum(payoff_loss_amt) as loss_amt from loan_performance group by lpmperiod, rollup(deal_name, pool_name), datatype )"
+sql = sql & "select lpmperiod, datatype, case when deal_name is null then datatype when substr(deal_name, -1) in ('@', '*') then substr(deal_name, 1, length(deal_name)-1) else deal_name end deal_name, case when pool_name is null then 'DEAL' when substr(pool_name, -1) in ('@', '*') then substr(pool_name, 1, length(pool_name)-1) else pool_name end pool_name, sch_bal,"
+sql = sql & "case when sch_bal >0 then round(100*(1 - power(1- (prepay/sch_bal), 12)), 2) else null end as CPR,case when sch_bal >0 then round(100*(1 - power(1- ((payoff-prepay)/sch_bal), 12)), 2) else null end as CDR, case when inv_bal >0 then round(100*(delinq_bal/inv_bal), 2) else null end as delinq, case when loss_bal >0 then round(100*loss_amt/loss_bal, 2) else null end as severity from pool_performance ));"
+ 
+Dim updateResult As String: updateResult = Application.Run("aig.MI.OracleExecute", connHandler, sql, True)
+Range("UpdateInfo") = updateResult
+ 
+End Sub
+ 
+Sub Generate_Surveillance()
+Dim controlSht As Worksheet
+Set controlSht = ThisWorkbook.Sheets("Control")
+If Range("PassWord").Value = "" Then
+    Range("PassWord").Value = InputBox("Please input your password to database for user name " + Range("UserName").Value)
+End If
+Dim connHandler As String: connHandler = Application.Run("aig.MI.OracleConnection", "UpdateHist", Range("UserName").Value, Range("PassWord").Value, "IDWDEV.aig.com", True)
+Dim DP As String
+DP = Range("DataPeriod").Value
+Dim sql As String
+sql = "with pool_surv as (select ramp.lpmperiod, ramp.deal_name, ramp.pool_name, ramp.datatype ramp_type, hist1.datatype pool_type, hist1.sch_bal, ramp.metric,"
+sql = sql & "case ramp.metric when 'CPR' then hist1.cpr when 'CDR' then hist1.cdr when 'SEVERITY' then hist1.severity when 'DELINQ' then hist1.delinq else null end as act1,"
+sql = sql & "case ramp.metric when 'CPR' then hist2.cpr when 'CDR' then hist2.cdr when 'SEVERITY' then hist2.severity when 'DELINQ' then hist2.delinq else null end as act2,"
+sql = sql & "case ramp.metric when 'CPR' then hist3.cpr when 'CDR' then hist3.cdr when 'SEVERITY' then hist3.severity when 'DELINQ' then hist3.delinq else null end as act3,"
+sql = sql & "case ramp.metric when 'CPR' then hist4.cpr when 'CDR' then hist4.cdr when 'SEVERITY' then hist4.severity when 'DELINQ' then hist4.delinq else null end as act4,"
+sql = sql & "case ramp.metric when 'CPR' then hist5.cpr when 'CDR' then hist5.cdr when 'SEVERITY' then hist5.severity when 'DELINQ' then hist5.delinq else null end as act5,"
+sql = sql & "case ramp.metric when 'CPR' then hist6.cpr when 'CDR' then hist6.cdr when 'SEVERITY' then hist6.severity when 'DELINQ' then hist6.delinq else null end as act6,"
+sql = sql & "ramp.period1 as proj1, ramp.period2 as proj2, ramp.period3 as proj3, ramp.period4 as proj4, ramp.period5 as proj5, ramp.period6 as proj6 "
+sql = sql & "from prismods.lp_ramp_vector ramp join prismods.lp_hist_vector hist1 on ramp.lpmperiod + 6= '"
+sql = sql & DP
+sql = sql & "' and ramp.lpmperiod = hist1.lpmperiod - 1 and ramp.deal_name = hist1.deal_name and ramp.pool_name = hist1.pool_name"
+sql = sql & " join prismods.lp_hist_vector hist2 on  ramp.lpmperiod = hist2.lpmperiod - 2 and ramp.deal_name = hist2.deal_name and ramp.pool_name = hist2.pool_name and hist1.datatype = hist2.datatype"
+sql = sql & " join prismods.lp_hist_vector hist3 on  ramp.lpmperiod = hist3.lpmperiod - 3 and ramp.deal_name = hist3.deal_name and ramp.pool_name = hist3.pool_name and hist1.datatype = hist3.datatype"
+sql = sql & " join prismods.lp_hist_vector hist4 on  ramp.lpmperiod = hist4.lpmperiod - 4 and ramp.deal_name = hist4.deal_name and ramp.pool_name = hist4.pool_name and hist1.datatype = hist4.datatype"
+sql = sql & " join prismods.lp_hist_vector hist5 on  ramp.lpmperiod = hist5.lpmperiod - 5 and ramp.deal_name = hist5.deal_name and ramp.pool_name = hist5.pool_name and hist1.datatype = hist5.datatype"
+sql = sql & " join prismods.lp_hist_vector hist6 on  ramp.lpmperiod = hist6.lpmperiod - 6 and ramp.deal_name = hist6.deal_name and ramp.pool_name = hist6.pool_name and hist1.datatype = hist6.datatype"
+sql = sql & " order by deal_name, pool_name, ramp_type, pool_type, case when metric='CPR' then 1 when metric='CDR' then 2 when metric='DELINQ' then 3 when metric='SEVERITY' then 4 else 5 end)"
+sql = sql & "select ramp_type, metric, round(sum(sch_bal)/1000000, 2) total_bal_M,"
+sql = sql & "round(sum(sch_bal*act1)/sum(sch_bal), 2) act1, round(sum(sch_bal*act2)/sum(sch_bal), 2) act2, round(sum(sch_bal*act3)/sum(sch_bal), 2) act3,"
+sql = sql & "round(sum(sch_bal*act4)/sum(sch_bal), 2) act4, round(sum(sch_bal*act5)/sum(sch_bal), 2) act5, round(sum(sch_bal*act6)/sum(sch_bal), 2) act6,"
+sql = sql & "round(sum(sch_bal*proj1)/sum(sch_bal), 2) proj1, round(sum(sch_bal*proj2)/sum(sch_bal), 2) proj2, round(sum(sch_bal*proj3)/sum(sch_bal), 2) proj3,"
+sql = sql & "round(sum(sch_bal*proj4)/sum(sch_bal), 2) proj4, round(sum(sch_bal*proj5)/sum(sch_bal), 2) proj5, round(sum(sch_bal*proj6)/sum(sch_bal), 2) proj6 "
+sql = sql & "from pool_surv group by (ramp_type, metric) order by ramp_type, metric"
+ 
+'controlSht.Cells(30, 2) = sql
+result = Application.Run("aig.MI.OracleQuery", "MyQuery", connHandler, sql, "Y")
+Dim survSht As Worksheet
+Set survSht = ThisWorkbook.Sheets("Surveillance")
+sqlResult = Application.Run("aig.MI.OracleQueryResulttoTable", "MyTable", result)
+surv = Application.Run("aig.ITABLE.get", sqlResult)
+survSht.Cells(1, 1).Value = "Surveillance of 6m historical verses projected performances for DP " & DP & " (loan tape from period " & CStr(DP - 6) & ")"
+survSht.[a2].Resize(UBound(surv), UBound(Application.Transpose(surv))) = surv
+ 
+ 
+End Sub
