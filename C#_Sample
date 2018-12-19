@@ -1,0 +1,408 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.IO;
+using System.Text.RegularExpressions;
+using MU = MN_Utils.MN_Utils;
+using MN_Utils.ExtensionMethods;
+using ModLib;
+using CommandLineRunner;
+ 
+ 
+namespace LPInfo
+{
+    [Serializable]
+    public class LPCusipInfo // Added
+    {
+        public string cusip;
+        public string deal_name;
+        public int DP;
+        public string DP_YYYYMM;
+        public string deal_type;
+        public string as_at_date_oracle_style;
+        public string status_message;      
+    }
+ 
+    public class LPDealInfo
+    {
+        public string deal_name;
+        public string DP_YYYYMM;
+        public int DP;
+        public string as_at_date_oracle_style;
+        public string status_message;
+        public string[,] pool_list_with_pool_type;
+    }
+ 
+    public class LPLoanTape
+    {
+        public string[][] lld;
+        public string[][] lldc;
+    }
+ 
+    public class LPPeriod // added
+    {
+        public int LPMPERIOD;
+        public string as_of_month;
+        public DateTime effective_date;
+        public DateTime expiration_date;
+    }
+ 
+    public class LPInfo
+    {
+        const string UserName = "mwilson";
+        const string Password = "Work21aig!";
+ 
+        static List<LPPeriod>LP_Period;
+        // static List<LPCusipInfo> LP_Cusip;
+ 
+        static LPInfo()
+        {            
+            LP_Period = new List<LPPeriod>();
+            var reader = new StreamReader(File.OpenRead(ModLib.ModNetGlobals.FILE_CACHE + @"\LPInfo\LP_Period.csv"));
+            while (!reader.EndOfStream)
+            {
+                LPPeriod lp = new LPPeriod();
+                var line = reader.ReadLine();
+                var values = line.Split(',');
+                lp.LPMPERIOD = Int32.Parse(values[0]);
+                lp.as_of_month = values[1].Trim();
+                lp.effective_date = Convert.ToDateTime(values[2]);
+                lp.expiration_date = Convert.ToDateTime(values[3]);
+                LP_Period.Add(lp);
+            }
+ 
+        }
+ 
+        // sample: get_cusip_info('02151BAB4', 42522, 42582), at_at_date should be >= latest DP date + 60, simplified to >= settle_date + 60 for now
+        public static LPCusipInfo get_cusip_info(string security_id, int settle_date_serial, int as_at_date_serial)
+        {
+            LPCusipInfo cusip_info = new LPCusipInfo();
+            cusip_info.cusip = security_id;
+            DateTime settle_date = DateTime.FromOADate(settle_date_serial);
+            DateTime as_at_in = DateTime.FromOADate(as_at_date_serial);
+            string settle_YYYYMM = settle_date.ToString("yyyyMM");
+            int settle_dp = MU.data_period_from_yyyymm(settle_YYYYMM); // Direct conversion of settle date to dp, need to be adjusted according to as_at_date
+            cusip_info.as_at_date_oracle_style = "24-SEP-2014"; // Oldest as_at_date from LP_Period table
+            int as_at_dp = 307; // Oldest as_at_DP from LP_Period table
+            string as_at_YYYYMM = "201407"; // keep track of the line from lp_period table with the input as_at_date
+            for (int n=0; n<LP_Period.Count; n++) 
+            {
+                // map the input as_at_date to the latest effective_date <= as_at_date
+                if (LP_Period[n].effective_date<=as_at_in && LP_Period[n].expiration_date>as_at_in)
+                {
+                    cusip_info.as_at_date_oracle_style = LP_Period[n].effective_date.ToString("dd-MMM-yyyy");
+                    as_at_dp = LP_Period[n].LPMPERIOD;
+                    as_at_YYYYMM = LP_Period[n].as_of_month;
+                }
+                // map the input settle_date to the latest DP with effective_date <= settle_date
+                if (LP_Period[n].effective_date <= settle_date&& LP_Period[n].expiration_date > settle_date)
+                {
+                    settle_dp = LP_Period[n].LPMPERIOD;
+                    settle_YYYYMM = LP_Period[n].as_of_month;
+                }
+            }
+            if (settle_dp > as_at_dp)
+            {
+                cusip_info.DP = as_at_dp;
+                cusip_info.DP_YYYYMM = as_at_YYYYMM;
+                cusip_info.status_message = "didn't find loan tape for settle date, using prior data period";
+            }
+            else
+            {
+                cusip_info.DP = settle_dp;
+                cusip_info.DP_YYYYMM = settle_YYYYMM;
+                cusip_info.status_message = "";
+            }
+ 
+            bool cached = false;
+            string CusipInfo_directory = ModLib.ModNetGlobals.FILE_CACHE + @"\LPInfo";
+            string DP_AsAt_subdirectory = string.Format(@"{0}\DP{1}_AsAt_{2}", CusipInfo_directory, cusip_info.DP, cusip_info.as_at_date_oracle_style);
+            string CusipInfo_file_fullpath = string.Format(@"{0}\CusipInfo.csv", DP_AsAt_subdirectory);
+            if (!Directory.Exists(DP_AsAt_subdirectory))
+            {
+                Directory.CreateDirectory(DP_AsAt_subdirectory);
+            }
+            if (File.Exists(CusipInfo_file_fullpath))
+            {
+                var lines = File.ReadLines(CusipInfo_file_fullpath);
+                foreach (string line in lines)
+                {
+                    if (line.Contains(cusip_info.cusip))
+                    {
+                        cached = true;
+                        string[] cusip_info_readin = line.Split(',');
+                        cusip_info.deal_name = cusip_info_readin[1].Trim();
+                        cusip_info.DP = Int32.Parse(cusip_info_readin[2]);
+                        cusip_info.DP_YYYYMM = cusip_info_readin[3].Trim();
+                        cusip_info.deal_type = cusip_info_readin[4].Trim();
+                        cusip_info.as_at_date_oracle_style = cusip_info_readin[5].Trim();
+                    }
+                }
+            }
+ 
+            if (!cached)
+            {
+                // Get deal_name
+                string dealSQL = @"select lp_deal_name from prism.lp_deal_to_cusip_mapping where cusip = '&cusip_in' and latest_record_indicator = 'Y'";
+                dealSQL = dealSQL.Replace("&cusip_in", security_id);
+ 
+                string result1 = "";
+ 
+                try
+                {
+                    result1 = MU.getQueryDataBasic(dealSQL, "idwprd.world", UserName, Password).queryResults[0, 0].ToString();
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("This security is likely not in LPRM, or there is a connection error.\r\n" + ex.Message + "\r\n" + ex.StackTrace);
+                }
+ 
+                cusip_info.deal_name = result1.Trim();
+ 
+                // deal type is the most presented pool type in that deal by pool count, not balance or loan count
+                string poolTypeSQL = @"with pool as (select distinct lp_pool_name as name from prism.lp_pool_to_cusip_mapping where LATEST_RECORD_INDICATOR='Y' and lp_deal_name = '&deal_name_in')
+                                    select case when substr(name, -1) in ('@','*') then substr(name, 1, length(name)-1) else name end as pool_name,
+                                    case when substr(name, -1)='@' then 'ALTA' when substr(name, -1)='*' then 'SUBPRIME' else 'PRIME' end as data_type from pool";
+                poolTypeSQL = poolTypeSQL.Replace("&deal_name_in", cusip_info.deal_name);
+                var result3 = MU.getQueryDataBasic(poolTypeSQL, "idwprd.world", UserName, Password).queryResults;
+                int alta = 0; int subprime = 0; int prime = 0;
+                int poolCount = result3.Length;
+                for (int i = 0; i < result3.GetLength(0); i++)
+                {
+                    if (result3[i, 1].ToString() == "ALTA") { alta++; }
+                    else if (result3[i, 1].ToString() == "SUBPRIME") { subprime++; }
+                    else { prime++; }
+                }
+                if (subprime >= alta && subprime >= prime) { cusip_info.deal_type = "SUBPRIME"; }
+                else if (alta > subprime && alta >= prime) { cusip_info.deal_type = "ALTA"; }
+                else { cusip_info.deal_type = "PRIME"; }
+ 
+                string cusip_info_line = string.Format(@"{0}, {1}, {2}, {3}, {4}, {5}", cusip_info.cusip, cusip_info.deal_name, cusip_info.DP, cusip_info.DP_YYYYMM, cusip_info.deal_type, cusip_info.as_at_date_oracle_style);
+                File.AppendAllLines(CusipInfo_file_fullpath, new[] { cusip_info_line });
+            }
+ 
+            return cusip_info;
+        }
+ 
+ 
+        // If exist, read in; if not, generate lld and lldc; return then as string[][].
+        public static LPLoanTape deal_to_loan_tape(string deal_name, string DP_YYYYMM, string as_at_date_oracle_style, bool force_regenerate = false, bool as_at_subdirectory = false)
+        {
+            var AssemblyDirectory = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+            LPLoanTape loan_tape = new LPLoanTape();
+ 
+            // Get data period as string
+            string data_period = MU.data_period_from_yyyymm(DP_YYYYMM).ToString();
+            string formatted_name = deal_name.Replace(" ", "_").Replace("-", "_");
+            string lld_directory = ModLib.ModNetGlobals.FILE_CACHE + @"\LPInfo";
+            string dp_deal_subdirectory = Path.Combine(lld_directory, "DP" + data_period + (as_at_subdirectory ? ("_AsAt" + as_at_date_oracle_style) : ""), formatted_name);
+            string lld_file_fullpath = Path.Combine(dp_deal_subdirectory, "DP" + data_period + "_" + formatted_name + ".csv");
+            
+            if (!Directory.Exists(dp_deal_subdirectory))
+            {          
+                Directory.CreateDirectory(dp_deal_subdirectory);
+            }
+            if (!File.Exists(lld_file_fullpath) || force_regenerate) // check if the lld already exists
+            {
+                // get standard query from LLD_Generator.sql. Replaced the keywords with the inputs.
+                string lld_sql = MU.file_to_string(Path.Combine(AssemblyDirectory, "lld_generator.sql"))
+                                 .Replace("&lp_deal_name_in", deal_name)
+                                 .Replace("&data_period_in", data_period)
+                                 .Replace("&as_at_date_in", as_at_date_oracle_style);
+ 
+                // getQueryDataBasic function returns DB table headers as string[] separately from DB table content as object[,]
+                MU.QueryResults queryResult = MU.getQueryDataBasic(lld_sql, "idwprd.world", UserName, Password);
+ 
+                // getQueryResultToObject() pieces header and content together as a single object
+                loan_tape.lld = getQueryResultToObject(queryResult);
+                MU.string_to_file(loan_tape.lld.ToCSVBuffer(encapsulate_with_quotes: true), lld_file_fullpath);
+            }
+            else 
+            {
+                 loan_tape.lld = File.ReadLines(lld_file_fullpath).Select(x => x.Split(',')).ToArray();
+            }
+ 
+ 
+            var lldc_directory = Path.GetDirectoryName(lld_file_fullpath);
+            var qa_file_path = Path.Combine(AssemblyDirectory, "conversion_wizard", "2015Q1_add_dials_Mortgage.qa");
+            var csf_file_path = Path.Combine(AssemblyDirectory, "conversion_wizard", "VS_RiskModel4.csf");
+            var lldc_file_fullpath = Path.Combine(lldc_directory, Path.GetFileNameWithoutExtension(lld_file_fullpath) + "_RM.csv");
+ 
+            if (!File.Exists(lldc_file_fullpath) || force_regenerate) // check if the lldc already exist
+            {
+                // format converter xml
+                string xml = MU.file_to_string(Path.Combine(AssemblyDirectory, "lld_converter.xml"))
+                             .Replace("{LLD_OUTPUT_DIR}", dp_deal_subdirectory)
+                             .Replace("{LLDC_OUTPUT_DIR}", lldc_directory)
+                             .Replace("{CSF_FILE_PATH}", csf_file_path)
+                             .Replace("{QA_FILE_PATH}", csf_file_path)
+                             .Replace("{AS_OF_DATE_IN_YYYYMM}", DP_YYYYMM)
+                             .Replace("{LLD_OUTPUT_FILE_NAME}", Path.GetFileName(lld_file_fullpath));
+                string xmlOutputPath = Path.Combine(lldc_directory, "LLDCS_" + Guid.NewGuid().ToString() + ".xml");
+                File.WriteAllText(xmlOutputPath, xml);
+ 
+                // run converter
+                string conversionWizardPath = Path.Combine(AssemblyDirectory, "conversion_wizard", "ConversionWizard.exe");
+                System.Diagnostics.Process process = new System.Diagnostics.Process();
+                System.Diagnostics.ProcessStartInfo startInfo = new System.Diagnostics.ProcessStartInfo();
+                startInfo.WorkingDirectory = Path.Combine(AssemblyDirectory, "conversion_wizard");
+                startInfo.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+                startInfo.FileName = conversionWizardPath;
+                startInfo.Arguments = "\"" + xmlOutputPath + "\"";
+                process.StartInfo = startInfo;
+                process.Start();
+                process.WaitForExit();
+            }
+ 
+            // read in LLDC
+            loan_tape.lldc = File.ReadLines(lldc_file_fullpath).Select(x => x.Split(',')).ToArray();
+ 
+            return loan_tape;
+        }
+                
+        static public string[][] getQueryResultToObject(MU.QueryResults qrIn)
+        {
+            int m = qrIn.queryResults.GetLength(0) + 1;
+            int n = qrIn.colNames.Length;
+            string[][] result = new string[m][];
+            for (int i = 0; i < m; i++)
+            {
+                result[i] = new string[n];
+                for (int j = 0; j < n; j++)
+                {
+                    result[i][j] = (i == 0) ? qrIn.colNames[j] : qrIn.queryResults[i - 1, j].ToString();
+                }
+            }
+            return result;
+        }
+ 
+        public static void LPInfo_Sample()
+        {
+            var CUSIPInfoTest = get_cusip_info("02151BAB4", 42522, 42705); // as_at_date set to 20161201
+ 
+            LPLoanTape LoanTapeTest = deal_to_loan_tape(CUSIPInfoTest.deal_name, CUSIPInfoTest.DP_YYYYMM, CUSIPInfoTest.as_at_date_oracle_style);
+        }
+ 
+    }
+ 
+    class LPInfoTest
+    {
+        // for testing cusip_info
+        // usage: LPInfo get_cusip_info 02151BAB4 42635 42705
+        public static void action_get_cusip_info(string cusip, string settle_date, string as_at_date)
+        {
+            LPCusipInfo cusip_info = new LPCusipInfo();
+            cusip_info = LPInfo.get_cusip_info(cusip, int.Parse(settle_date), int.Parse(as_at_date));
+        }
+ 
+        // for testing cusip_info and deal_asat_to_loan_tape
+        public static void action_test_cusip_lldc(string cusip, string settle_date, string as_at_date)
+        {
+            var cusip_info = LPInfo.get_cusip_info(cusip, int.Parse(settle_date), int.Parse(as_at_date));
+            var loan_tape = LPInfo.deal_to_loan_tape(cusip_info.deal_name, cusip_info.DP_YYYYMM, cusip_info.as_at_date_oracle_style, as_at_subdirectory:true);
+        }
+ 
+        
+        // usage: LPInfo cusip_to_lldc 02151BAB4 42635 42705
+        public static void action_cusip_to_lldc(string cusip, string settle_date, string as_at_date)
+        {
+            var cusip_info = LPInfo.get_cusip_info(cusip, int.Parse(settle_date), int.Parse(as_at_date));
+            var loan_tape = LPInfo.deal_to_loan_tape(cusip_info.deal_name, cusip_info.DP_YYYYMM, cusip_info.as_at_date_oracle_style, true);
+        }
+ 
+        // usage: LPInfo deal_to_lldc 
+        public static void action_deal_to_lldc(string deal_name, string DP_YYYYMM, string as_at_date_oracle_style)
+        {
+            var loan_tape = LPInfo.deal_to_loan_tape(deal_name, DP_YYYYMM, as_at_date_oracle_style);
+        }
+ 
+        // Small sample: LPInfo portfolio_to_lldc \LPInfo\cusiplist\NA_Cusip_List_Small_Test.csv 201604 1-JUN-2016
+        // Large sample: LPInfo portfolio_to_lldc \LPInfo\cusiplist\201610Modeled.csv 201610 1-DEC-2016
+        public static void action_portfolio_to_lldc(string cusip_list_csv, string DP_YYYYMM, string as_at_date_oracle_style)
+        {
+            string UserName = "JZHANG";
+            string Password = "Pass456*";
+            
+            // Read in cusips as a list<string>
+            var cusip_list = Regex.Split(MU.file_to_string(cusip_list_csv), "\r\n").ToList();
+ 
+            // split cusips into groups of 100 to stay under SQL length limit            
+            const int group_size = 100;
+            int cusip_count = cusip_list.Count;
+            int group_count = (cusip_count - 1 + group_size) / group_size; // This step uses C# default double to int typecast
+            List<string>deal_list = new List<string>();
+            string SQL = @"SELECT distinct lp_deal_name from prism.lp_deal_to_cusip_mapping deal where latest_record_indicator = 'Y' and cusip in ( &cusip_in )";
+ 
+            for (int i = 0; i < group_count; i++)
+            {
+                int low = 100 * i;
+                int range = (cusip_count - low > 100) ? 100 : cusip_count - low;
+                var group = cusip_list.GetRange(low, range);
+                string cusip_group = "";
+                foreach (var cusip in group)
+                {
+                    cusip_group = cusip_group + "'" + cusip + "', ";
+                }
+                cusip_group = cusip_group.TrimEnd(',', ' ');
+                if (cusip_group != "") // CSV files may have extra empty rows that needs to be skipped
+                {
+                    string GroupSQL = SQL.Replace("&cusip_in", cusip_group);
+                    var deal_group = MU.getQueryDataBasic(GroupSQL, "idwprd.world", UserName, Password).queryResults;
+                    foreach (string deal in deal_group)
+                    {
+                        deal_list.Add(deal);
+                    }
+                }
+            }
+ 
+            // remove duplicate deals
+            deal_list = deal_list.Distinct().ToList();
+ 
+            // parallel run settings
+            string runFolder = ModLib.ModNetGlobals.FILE_CACHE + @"\LPInfo\log";
+            if (!Directory.Exists(runFolder))
+            {
+                Directory.CreateDirectory(runFolder);
+            }
+            string machine_file_fullpath = @"C:\macros\modnet_machine.txt";
+            string batch_runner = @"\\investments.aig.net\prod\Apps\ModNet\_system\MACROS\batch_runner\bin\Debug\batch_runner.exe";
+ 
+            string cmd_str = "";
+ 
+            // parallel deal level LLD generation
+            foreach (string deal in deal_list)
+            {
+                cmd_str += String.Format("{0}\t{1}\t{2}\t{3}\t{4}\t{5}\r\n",
+                                        @"\\investments.aig.net\prod\Apps\ModNet\Models\LPInfo\1.2\bin\LPInfo.exe",
+                                        "deal_to_lldc " + "\"" + deal + "\"" + " " + DP_YYYYMM + " " + as_at_date_oracle_style,
+                                         runFolder,
+                                         "out_" + deal.Replace(" ", "_").Replace("-", "_") + ".txt",
+                                         "err_" + deal.Replace(" ", "_").Replace("-", "_") + ".txt",
+                                         "");
+            }
+            MU.string_to_file(cmd_str, runFolder + @"\portfolio_to_lldc_job_file.txt");
+            MU.RunCommandLine(batch_runner, "\"" + runFolder + "\\portfolio_to_lldc_job_file.txt\" " + machine_file_fullpath, runFolder);
+        }
+        
+        static void Main(string[] args)
+        {
+            // Temporary debug code for Sid
+            if (System.Environment.UserName == "sigandhi")
+            {
+                System.Environment.SetEnvironmentVariable("PATH", @"C:\oracle\instantclient_11_2_x86");
+                System.Environment.SetEnvironmentVariable("ORACLE_HOME", @"C:\oracle\instantclient_11_2_x86");
+            }
+ 
+            // load the configuration for shared memory etc
+            ModNet.ModNet.load_configuration();
+ 
+            // This sets up the list of current actions, shows help if no params specified
+            // and also tests the parameters of the function call, and executes the action 
+            // giving it the parameters specified in args.  Any function with name action_XX 
+            // can be called on the command line with XX as a verb and string parameters passed            
+            var cmdRunner = new CommandRunner(args);
+        }
+    }
+}
